@@ -1,0 +1,806 @@
+#esse modelo inclui o campo magnético definido pelo WMM25;
+# esse modelo inclui um magnetometro;
+#esse modelo usa um controle PD simples;
+#esse modelo usa 3x magnetorquer e 3x RW;
+
+import matplotlib.pyplot as plt
+import numpy as np
+
+from Basilisk.architecture import messaging, sysModel
+
+from Basilisk.utilities import (
+    SimulationBaseClass,
+    macros,
+    RigidBodyKinematics as rbk,  # Conversão MRP -> quatérnio (MRP2EP)
+    orbitalMotion,
+    simHelpers,                 
+    simIncludeGravBody,
+    vizSupport,
+    fswSetupRW,
+    simIncludeRW,
+)
+from Basilisk.utilities.supportDataTools.dataFetcher import get_path, DataFile
+
+from Basilisk.simulation import (
+    GravityGradientEffector,
+    extForceTorque,
+    msisAtmosphere,
+    simpleNav,
+    spacecraft,
+    zeroWindModel,
+    facetDragDynamicEffector,
+    facetSRPDynamicEffector,
+    eclipse,
+    meanRevertingNoiseStateEffector,
+    svIntegrators,
+    magneticFieldWMM,
+    magnetometer,
+    reactionWheelStateEffector,
+    motorVoltageInterface,
+    MtbEffector,
+)
+
+from Basilisk.fswAlgorithms import (
+    attTrackingError,
+    hillPoint, 
+    mrpFeedback,
+    inertial3D,
+    rwMotorTorque,
+    rwMotorVoltage,
+    tamComm,
+    mtbMomentumManagement,
+)
+
+#gemini + LM + claude ~ conexão do ruído estocástico com facetdrag
+class StochasticAtmoBridge(sysModel.SysModel):
+    def __init__(self, scObject, atmoModule, stateName):
+        super().__init__()
+        self.ModelTag = "StochasticAtmoBridge"
+        self.scObject = scObject
+        self.atmoModule = atmoModule
+        self.stateName = stateName
+        self.stateObject = None
+
+        self.stochAtmoPayload = messaging.AtmoPropsMsgPayload()
+        self.stochAtmoMsg = messaging.AtmoPropsMsg()
+
+    def Reset(self, CurrentSimNanos):
+        # O objeto de estado é obtido no primeiro UpdateState, quando o
+        # spacecraft já registrou todos os estados.
+        self.stateObject = None
+        # Escreve uma mensagem inicial para que a saída exista desde t = 0
+        self.stochAtmoPayload = messaging.AtmoPropsMsgPayload()
+        self.stochAtmoMsg.write(self.stochAtmoPayload, CurrentSimNanos, self.moduleID)
+
+    def UpdateState(self, CurrentSimNanos):
+        if self.stateObject is None:
+            self.stateObject = self.scObject.dynManager.getStateObject(self.stateName)
+
+        # delta_rho: estado escalar atual do processo de Ornstein-Uhlenbeck
+        delta_rho = float(np.array(self.stateObject.getState()).flatten()[0])
+
+        # Densidade nominal do MSIS [kg/m^3]
+        nominalDensity = self.atmoModule.envOutMsgs[0].read().neutralDensity
+
+        # rho_stoch = rho_nominal * (1 + delta_rho), limitada a valores não negativos
+        self.stochAtmoPayload.neutralDensity = max(0.0, nominalDensity * (1.0 + delta_rho))
+
+        self.stochAtmoMsg.write(self.stochAtmoPayload, CurrentSimNanos, self.moduleID)
+
+#derivado diretamente do anterior
+class StochasticSolarBridge(sysModel.SysModel):
+    def __init__(self, scObject, sunStateMsg, stateName, nominalSolarFlux=1361.0):
+        super().__init__()
+        self.ModelTag = "StochasticSolarBridge"
+        self.scObject = scObject
+        self.sunStateMsg = sunStateMsg
+        self.stateName = stateName
+        self.nominalSolarFlux = nominalSolarFlux
+        self.stateObject = None
+
+        self.stochSolarPayload = messaging.SolarFluxMsgPayload()
+        self.stochSolarMsg = messaging.SolarFluxMsg()
+
+    def Reset(self, CurrentSimNanos):
+        self.stateObject = None
+        self.stochSolarPayload.flux = self.nominalSolarFlux
+        self.stochSolarMsg.write(self.stochSolarPayload, CurrentSimNanos, self.moduleID)
+
+    def UpdateState(self, CurrentSimNanos):
+        if self.stateObject is None:
+            self.stateObject = self.scObject.dynManager.getStateObject(self.stateName)
+
+        delta_solar = float(np.array(self.stateObject.getState()).flatten()[0])
+
+        stoch_flux = max(0.0, self.nominalSolarFlux * (1.0 + delta_solar))
+        self.stochSolarPayload.flux = stoch_flux
+
+        self.stochSolarMsg.write(self.stochSolarPayload, CurrentSimNanos, self.moduleID)
+
+
+#configuração da simulação
+simProcessName = "simProcess"
+simTaskName = "simTask"
+tamTaskName = "100hzTask"
+fswTaskName = "fswTask"
+
+scSim = SimulationBaseClass.SimBaseClass()
+dynProcess = scSim.CreateNewProcess(simProcessName)
+
+simulationTimeStep = macros.sec2nano(0.1)  # alterar para 1kHz
+tamTimeStep = macros.sec2nano(0.1)        # alterar para 100Hz
+fswTimeStep = macros.sec2nano(0.1)        # manter em 10Hz
+
+dynProcess.addTask(scSim.CreateNewTask(simTaskName, simulationTimeStep))
+dynProcess.addTask(scSim.CreateNewTask(tamTaskName, tamTimeStep))
+dynProcess.addTask(scSim.CreateNewTask(fswTaskName, fswTimeStep))
+
+scSim.SetProgressBar(True)
+
+#definição do satélite
+scObject = spacecraft.Spacecraft()
+scObject.ModelTag = "cimatelite"
+
+hubMass = 4.0  # [kg]
+scObject.hub.mHub = hubMass
+
+# CubeSat 3U
+hubWidthX = 0.1   # [m]
+hubWidthY = 0.1   # [m]
+hubHeightZ = 0.3  # [m]
+
+hubAreaX = hubWidthY * hubHeightZ
+hubAreaY = hubWidthX * hubHeightZ
+hubAreaZ = hubWidthX * hubWidthY
+
+hubHalfX = hubWidthX / 2.0   # 0.05 m
+hubHalfY = hubWidthY / 2.0   # 0.05 m
+hubHalfZ = hubHeightZ / 2.0  # 0.15 m
+
+#inércia de um paralelepípedo retângulo sobre o centro de massa
+hubI11 = hubMass / 12.0 * (hubWidthY ** 2 + hubHeightZ ** 2)
+hubI22 = hubMass / 12.0 * (hubWidthX ** 2 + hubHeightZ ** 2)
+hubI33 = hubMass / 12.0 * (hubWidthX ** 2 + hubWidthY ** 2)
+
+I = [hubI11, 0.0, 0.0,
+     0.0, hubI22, 0.0,
+     0.0, 0.0, hubI33]
+
+scObject.hub.r_BcB_B = [[0.0], [0.0], [0.0]]
+scObject.hub.IHubPntBc_B = simHelpers.np2EigenMatrix3d(I)
+
+# Condições iniciais de atitude ~ sugestão do LM
+scObject.hub.sigma_BNInit = [[0.8], [-1.2], [1.0]]  # MRP
+scObject.hub.omega_BN_BInit = [
+    [60.0 * macros.D2R],
+    [40.0 * macros.D2R],
+    [50.0 * macros.D2R],
+]  # [rad/s]
+
+#definição dos corpos celestes (Terra e Sol) e interface SPICE
+gravFactory = simIncludeGravBody.gravBodyFactory()
+bodies = gravFactory.createBodies('earth', 'sun')
+
+planet = bodies['earth']
+planet.isCentralBody = True
+sun = bodies['sun']
+
+# Esféricos harmônicos de 10° ordem
+ggm03s_full_path = get_path(DataFile.LocalGravData.GGM03S)
+planet.useSphericalHarmonicsGravityModel(str(ggm03s_full_path), 10)
+mu = planet.mu
+
+gravFactory.addBodiesTo(scObject)
+
+# definições de órbita
+rLEO = planet.radEquator + 500.0 * 1000.0
+oe = orbitalMotion.ClassicElements()
+oe.a = rLEO
+oe.e = 0.0001
+oe.i = 33.3 * macros.D2R
+oe.Omega = 48.2 * macros.D2R
+oe.omega = 347.8 * macros.D2R
+oe.f = 85.3 * macros.D2R
+
+rN, vN = orbitalMotion.elem2rv(mu, oe)
+scObject.hub.r_CN_NInit = rN
+scObject.hub.v_CN_NInit = vN
+
+# Interface SPICE
+spiceObject = gravFactory.createSpiceInterface(
+    time="2020 MAY 21 18:28:03 (UTC)",
+    epochInMsg=True,
+)
+spiceObject.zeroBase = "Earth"
+scSim.AddModelToTask(simTaskName, spiceObject, ModelPriority=100)  # roda primeiro
+
+earthStateMsg = spiceObject.planetStateOutMsgs[0]  # Terra
+sunStateMsg = spiceObject.planetStateOutMsgs[1]    # Sol
+
+# Adiciona o satélite à tarefa principal
+scSim.AddModelToTask(simTaskName, scObject)
+
+# SOSRA é o integrador forte recomendado para ruído aditivo ~ scenarioStochasticDragSpacecraft
+integrator = svIntegrators.svStochasticIntegratorSOSRA(scObject)
+scObject.setIntegrator(integrator)
+
+#Definição das RW ~ Hyperion RW210
+v_nom = 3.3       # [V] Tensão nominal operacional (3.25V - 3.5V)
+torque_max = 0.0001  # [N.m] Torque máximo
+
+rwFactory = simIncludeRW.rwFactory()
+
+varRWModel = messaging.BalancedWheels
+#varRWModel = messaging.JitterSimple
+
+RW1 = rwFactory.create('custom', [1, 0, 0], maxMomentum=0.006, Omega=0.0  # RPM inicial
+                       , Omega_max = 15000.0 #RPM
+                       , u_max = torque_max
+                       , rWB_B=[0, 0, 0]  # meters
+                       , RWModel=varRWModel)
+
+RW2 = rwFactory.create('custom', [0, 1, 0], maxMomentum=0.006, Omega=0.0  # RPM inicial
+                       , Omega_max = 15000.0 #RPM
+                       , u_max = torque_max
+                       , rWB_B=[0, 0, 0]  # meters
+                       , RWModel=varRWModel)
+
+RW3 = rwFactory.create('custom', [0, 0, 1], maxMomentum=0.006, Omega=0.0  # RPM inicial
+                       , Omega_max = 15000.0 #RPM
+                       , u_max = torque_max
+                       , rWB_B=[0, 0, 0]  # meters
+                       , RWModel=varRWModel)
+
+numRW = rwFactory.getNumOfDevices()
+rwStateEffector = reactionWheelStateEffector.ReactionWheelStateEffector()
+rwStateEffector.ModelTag = "RW_cluster"
+rwFactory.addToSpacecraft(rwStateEffector.ModelTag, rwStateEffector, scObject)
+
+scSim.AddModelToTask(simTaskName, rwStateEffector, 2)
+
+gain_rw210 = torque_max / v_nom  # Ganho de conversão [N.m/V]
+
+rwVoltageIO = motorVoltageInterface.MotorVoltageInterface()
+rwVoltageIO.ModelTag = "rwVoltageInterface"
+rwVoltageIO.setGains(np.array([gain_rw210] * numRW))
+
+scSim.AddModelToTask(simTaskName, rwVoltageIO)
+
+#Campo magnético WMM25
+magModule = magneticFieldWMM.MagneticFieldWMM()
+wmm_path = get_path(DataFile.MagneticFieldData.WMM)
+magModule.configureWMMFile(str(wmm_path))
+magModule.ModelTag = "WMM"
+
+magModule.addSpacecraftToModel(scObject.scStateOutMsg)
+scSim.AddModelToTask(simTaskName, magModule)
+
+magModule.epochInMsg.subscribeTo(gravFactory.epochMsg)
+
+#3-axis magnetometer ~ MPU9250
+TAM = magnetometer.Magnetometer()
+TAM.ModelTag = "TAM_sensor"
+TAM.scaleFactor = 1.0
+
+TAM.senNoiseStd = [600e-9, 600e-9, 600e-9] # 0.6µT
+TAM.senBias = [0, 0, -1e-6]  # copiado do example do basilisk
+TAM.maxOutput = 4.8e-3   #  4800µT
+TAM.minOutput = -4.8e-3  # -4800µT
+
+tamCommObj = tamComm.tamComm()
+tamCommObj.dcm_BS = [1., 0., 0., 0., 1., 0., 0., 0., 1.]
+tamCommObj.ModelTag = "tamComm"
+
+TAM.stateInMsg.subscribeTo(scObject.scStateOutMsg)
+TAM.magInMsg.subscribeTo(magModule.envOutMsgs[0])
+tamCommObj.tamInMsg.subscribeTo(TAM.tamDataOutMsg)
+
+scSim.AddModelToTask(tamTaskName, TAM)
+scSim.AddModelToTask(simTaskName, tamCommObj)
+
+#Magnetorquer ~ Hyperion HT-MTQ200
+mtbEff = MtbEffector.MtbEffector()
+mtbEff.ModelTag = "MtbEff"
+scObject.addDynamicEffector(mtbEff)
+scSim.AddModelToTask(simTaskName, mtbEff)
+
+mtbMomentumManagementObj = mtbMomentumManagement.mtbMomentumManagement()
+mtbMomentumManagementObj.wheelSpeedBiases = [1000. * macros.rpm2radsec, 1000. * macros.rpm2radsec,
+                                             1000. * macros.rpm2radsec]
+mtbMomentumManagementObj.cGain = 0.003
+mtbMomentumManagementObj.ModelTag = "mtbMomentumManagement"
+scSim.AddModelToTask(simTaskName, mtbMomentumManagementObj)
+
+mtbConfigParams = messaging.MTBArrayConfigMsgPayload()
+mtbConfigParams.numMTB = 3
+maxDipole = 1.0
+mtbConfigParams.GtMatrix_B =[1.0, 0., 0.,
+                             0., 1.0, 0.,
+                             0., 0., 1.0]
+
+mtbConfigParams.maxMtbDipoles = [maxDipole]*mtbConfigParams.numMTB
+mtbParamsInMsg = messaging.MTBArrayConfigMsg().write(mtbConfigParams)
+
+
+# Atmosfera MSIS
+atmo = msisAtmosphere.MsisAtmosphere()
+atmo.ModelTag = "MsisAtmo"
+
+# Índices de atividade solar (F10.7 e Ap)
+ap = 8
+f107 = 110
+#atualização futura - usar dados reais de clima espacial
+sw_msg = {
+    "ap_24_0": ap, "ap_3_0": ap, "ap_3_-3": ap, "ap_3_-6": ap, "ap_3_-9": ap,
+    "ap_3_-12": ap, "ap_3_-15": ap, "ap_3_-18": ap, "ap_3_-21": ap, "ap_3_-24": ap,
+    "ap_3_-27": ap, "ap_3_-30": ap, "ap_3_-33": ap, "ap_3_-36": ap, "ap_3_-39": ap,
+    "ap_3_-42": ap, "ap_3_-45": ap, "ap_3_-48": ap, "ap_3_-51": ap, "ap_3_-54": ap,
+    "ap_3_-57": ap, "f107_1944_0": f107, "f107_24_-24": f107,
+}
+
+swMsgList = []
+for c, val in enumerate(sw_msg.values()):
+    swMsgData = messaging.SwDataMsgPayload(dataValue=val)
+    swMsgList.append(messaging.SwDataMsg().write(swMsgData))
+    atmo.swDataInMsgs[c].subscribeTo(swMsgList[-1])
+
+atmo.planetPosInMsg.subscribeTo(earthStateMsg)
+atmo.epochInMsg.subscribeTo(gravFactory.epochMsg)
+atmo.addSpacecraftToModel(scObject.scStateOutMsg)
+# Prioridade acima da ponte: a ponte precisa ler a densidade já atualizada do MSIS
+scSim.AddModelToTask(simTaskName, atmo, ModelPriority=90)
+
+# Variação estocástica da densidade
+stochasticNoise = meanRevertingNoiseStateEffector.MeanRevertingNoiseStateEffector()
+stochasticNoise.ModelTag = "StochasticExpAtmo"
+stochasticNoise.setStationaryStd(0.15)       # desvio padrão estacionário de delta_rho
+stochasticNoise.setTimeConstant(10 * 60.0)  # [s]
+scObject.addStateEffector(stochasticNoise)
+
+atmoBridge = StochasticAtmoBridge(scObject, atmo, stochasticNoise.getStateName())
+scSim.AddModelToTask(simTaskName, atmoBridge, ModelPriority=80)
+
+# modelagem do vento ~ zerowind model
+windModel = zeroWindModel.ZeroWindModel()
+windModel.ModelTag = "ZeroWind"
+windModel.planetPosInMsg.subscribeTo(earthStateMsg)
+windModel.epochInMsg.subscribeTo(gravFactory.epochMsg)
+windModel.addSpacecraftToModel(scObject.scStateOutMsg)
+scSim.AddModelToTask(simTaskName, windModel)
+
+#modelagem SRP
+SRPEffector = facetSRPDynamicEffector.FacetSRPDynamicEffector()
+SRPEffector.ModelTag = "SRPEffector"
+SRPEffector.setNumFacets(6) 
+
+#ruído estocástico no fluxo solar
+stochasticSolarNoise = meanRevertingNoiseStateEffector.MeanRevertingNoiseStateEffector()
+stochasticSolarNoise.ModelTag = "StochasticSolarNoise"
+stochasticSolarNoise.setStationaryStd(0.01)          # Desvio padrão de ~1% no fluxo solar
+stochasticSolarNoise.setTimeConstant(10.0 * 60.0)     
+scObject.addStateEffector(stochasticSolarNoise)
+
+solarBridge = StochasticSolarBridge(
+    scObject=scObject, 
+    sunStateMsg=sunStateMsg, 
+    stateName=stochasticSolarNoise.getStateName(),
+    nominalSolarFlux=1361.0  # Constante solar nominal [W/m^2]
+)
+scSim.AddModelToTask(simTaskName, solarBridge, ModelPriority=85)
+
+#Facets: Aerodrag e SRP
+dragCoeff = 2.2
+sigSpec = 0.068 #referente aos materiais da placa solar ~ GaInP/GaAs/Ge on Ge substrate
+sigDiff = 0.012 #idem
+
+hubDrag = facetDragDynamicEffector.FacetDragDynamicEffector()
+hubDrag.ModelTag = "hubDrag"
+
+def addCubesatFacets(facetDrag, facetSRP):
+    halfDims = [hubHalfX, hubHalfY, hubHalfZ]
+    areas = [hubAreaX, hubAreaY, hubAreaZ]
+
+    dcm_identity = [[1.0, 0.0, 0.0],
+                    [0.0, 1.0, 0.0],
+                    [0.0, 0.0, 1.0]]
+
+    for axis in (0, 1, 2):
+        for sign in (+1.0, -1.0):
+            normal_list = [0.0, 0.0, 0.0]
+            normal_list[axis] = sign
+
+            location_list = [0.0, 0.0, 0.0]
+            location_list[axis] = sign * halfDims[axis]
+
+            rot_list = [0.0, 0.0, 0.0]
+
+            # Aerodrag (4 parâmetros)
+            facetDrag.addFacet(areas[axis], dragCoeff,
+                               np.array(normal_list), np.array(location_list))
+
+            # SRP (7 parâmetros)
+            facetSRP.addFacet(
+                areas[axis],    # 1. Área [m^2]
+                dcm_identity,   # 2. Matriz de orientação da faceta [3x3]
+                normal_list,    # 3. Normal da faceta [1x3]
+                rot_list,       # 4. Eixo de rotação [1x3]
+                location_list,  # 5. Localização / centro de pressão [1x3]
+                sigDiff,        # 6. Coeficiente difuso
+                sigSpec,        # 7. Coeficiente especular
+            )
+
+
+addCubesatFacets(hubDrag, SRPEffector)
+
+# Conexões do arrasto
+hubDrag.atmoDensInMsg.subscribeTo(atmoBridge.stochAtmoMsg)
+hubDrag.windVelInMsg.subscribeTo(windModel.envOutMsgs[0])
+scObject.addDynamicEffector(hubDrag)
+scSim.AddModelToTask(simTaskName, hubDrag)
+
+#definição do eclipse
+eclipseObject = eclipse.Eclipse()
+eclipseObject.ModelTag = "EarthEclipse"
+
+eclipseObject.addSpacecraftToModel(scObject.scStateOutMsg)
+eclipseObject.addPlanetToModel(earthStateMsg)  # corpo eclipsante: Terra (SPICE [0])
+eclipseObject.sunInMsg.subscribeTo(sunStateMsg)  # fonte luminosa: Sol (SPICE [1])
+scSim.AddModelToTask(simTaskName, eclipseObject)
+
+# Conexões do SRP
+SRPEffector.sunEclipseInMsg.subscribeTo(eclipseObject.eclipseOutMsgs[0])
+SRPEffector.sunInMsg.subscribeTo(sunStateMsg)
+if hasattr(SRPEffector, "solarFluxInMsg"):
+    SRPEffector.solarFluxInMsg.subscribeTo(solarBridge.stochSolarMsg)
+
+scObject.addDynamicEffector(SRPEffector)
+scSim.AddModelToTask(simTaskName, SRPEffector, ModelPriority=70)
+
+#Gradiente de gravidade
+ggEff = GravityGradientEffector.GravityGradientEffector()
+ggEff.ModelTag = scObject.ModelTag
+ggEff.addPlanetName(planet.planetName)
+scObject.addDynamicEffector(ggEff)
+scSim.AddModelToTask(simTaskName, ggEff)
+
+#definição dos sensores de atitude
+sNavObject = simpleNav.SimpleNav()
+sNavObject.ModelTag = "SimpleNavigation"
+scSim.AddModelToTask(fswTaskName, sNavObject)
+
+# setup hillPoint guidance module
+attGuidance = hillPoint.hillPoint()
+attGuidance.ModelTag = "hillPoint"
+scSim.AddModelToTask(fswTaskName, attGuidance)
+
+# setup the attitude tracking error evaluation module
+attError = attTrackingError.attTrackingError()
+attError.ModelTag = "attError"
+scSim.AddModelToTask(fswTaskName, attError)
+
+attError.sigma_R0R = [0, 1, 0]
+
+# Conecta o sensor de navegação aos estados reais do satélite
+sNavObject.scStateInMsg.subscribeTo(scObject.scStateOutMsg)
+
+attGuidance.transNavInMsg.subscribeTo(sNavObject.transOutMsg)
+
+# Conecta o calculador de erro de atitude ao sensor e à referência Nadir
+attError.attNavInMsg.subscribeTo(sNavObject.attOutMsg)
+attError.attRefInMsg.subscribeTo(attGuidance.attRefOutMsg)
+
+# setup the MRP Feedback control module
+mrpControl = mrpFeedback.mrpFeedback()
+mrpControl.ModelTag = "mrpFeedback"
+scSim.AddModelToTask(fswTaskName, mrpControl)
+
+mrpControl.K = 0.001    # Proporcional
+mrpControl.P = 0.015    # Derivativo 
+mrpControl.Ki = -1.0    # Integral 
+
+fswRwParamMsg = rwFactory.getConfigMessage()
+vehicleConfigOut = messaging.VehicleConfigMsgPayload(ISCPntB_B=I)
+vcMsg = messaging.VehicleConfigMsg().write(vehicleConfigOut)
+
+#links
+mrpControl.guidInMsg.subscribeTo(attError.attGuidOutMsg)
+mrpControl.vehConfigInMsg.subscribeTo(vcMsg)
+mrpControl.rwParamsInMsg.subscribeTo(fswRwParamMsg)
+mrpControl.rwSpeedsInMsg.subscribeTo(rwStateEffector.rwSpeedOutMsg)
+
+# add module that maps the Lr control torque into the RW motor torques
+rwMotorTorqueObj = rwMotorTorque.rwMotorTorque()
+rwMotorTorqueObj.ModelTag = "rwMotorTorque"
+scSim.AddModelToTask(fswTaskName, rwMotorTorqueObj)
+
+#links
+rwMotorTorqueObj.rwParamsInMsg.subscribeTo(fswRwParamMsg)
+rwMotorTorqueObj.vehControlInMsg.subscribeTo(mrpControl.cmdTorqueOutMsg)
+
+# Make the RW control all three body axes
+controlAxes_B = [1, 0, 0, 0, 1, 0, 0, 0, 1]
+rwMotorTorqueObj.controlAxes_B = controlAxes_B
+
+fswRWVoltage = rwMotorVoltage.rwMotorVoltage()
+fswRWVoltage.ModelTag = "rwMotorVoltage"
+
+# Add test module to runtime call list
+scSim.AddModelToTask(fswTaskName, fswRWVoltage)
+
+fswRWVoltage.VMin = -3.5
+fswRWVoltage.VMax = 3.5
+
+#links MTB +RW
+mtbMomentumManagementObj.rwParamsInMsg.subscribeTo(fswRwParamMsg)
+mtbMomentumManagementObj.mtbParamsInMsg.subscribeTo(mtbParamsInMsg)
+mtbMomentumManagementObj.tamSensorBodyInMsg.subscribeTo(tamCommObj.tamOutMsg)
+mtbMomentumManagementObj.rwSpeedsInMsg.subscribeTo(rwStateEffector.rwSpeedOutMsg)
+mtbMomentumManagementObj.rwMotorTorqueInMsg.subscribeTo(rwMotorTorqueObj.rwMotorTorqueOutMsg)
+
+fswRWVoltage.torqueInMsg.subscribeTo(mtbMomentumManagementObj.rwMotorTorqueOutMsg)
+fswRWVoltage.rwParamsInMsg.subscribeTo(fswRwParamMsg)
+rwVoltageIO.motorVoltageInMsg.subscribeTo(fswRWVoltage.voltageOutMsg)
+rwStateEffector.rwMotorCmdInMsg.subscribeTo(rwVoltageIO.motorTorqueOutMsg)
+
+mtbEff.mtbCmdInMsg.subscribeTo(mtbMomentumManagementObj.mtbCmdOutMsg)
+mtbEff.mtbParamsInMsg.subscribeTo(mtbParamsInMsg)
+mtbEff.magInMsg.subscribeTo(magModule.envOutMsgs[0])
+
+# set the simulation time
+n = np.sqrt(mu / oe.a / oe.a / oe.a)
+P = 2.0 * np.pi / n
+
+simulationTime = macros.sec2nano(1*P)
+
+#full gemini
+# 1. CONFIGURAÇÃO E REGISTRO DE DADOS 
+numDataPoints = 1000
+samplingTime = simHelpers.samplingTime(simulationTime, simulationTimeStep, numDataPoints)
+
+# Registradores de Navegação e Atitude
+snLog = sNavObject.transOutMsg.recorder(samplingTime)
+attErrorLog = attError.attGuidOutMsg.recorder(samplingTime)
+scSim.AddModelToTask(simTaskName, snLog)
+scSim.AddModelToTask(simTaskName, attErrorLog)
+
+# Registradores de Ambiente, Pontes Estocásticas e Eclipse
+deterministicAtmoLog = atmo.envOutMsgs[0].recorder(samplingTime)
+stochasticAtmoLog = atmoBridge.stochAtmoMsg.recorder(samplingTime)
+solarLog = solarBridge.stochSolarMsg.recorder(samplingTime)
+eclipseLog = eclipseObject.eclipseOutMsgs[0].recorder(samplingTime)
+magLog = magModule.envOutMsgs[0].recorder(samplingTime)
+tamLog = TAM.tamDataOutMsg.recorder(samplingTime)
+mtbLog = mtbEff.logger(["torqueExternalPntB_B"], samplingTime)
+
+scSim.AddModelToTask(simTaskName, deterministicAtmoLog)
+scSim.AddModelToTask(simTaskName, stochasticAtmoLog)
+scSim.AddModelToTask(simTaskName, solarLog)
+scSim.AddModelToTask(simTaskName, eclipseLog)
+scSim.AddModelToTask(simTaskName, magLog)
+scSim.AddModelToTask(tamTaskName, tamLog)
+scSim.AddModelToTask(simTaskName, mtbLog)
+
+# Registradores Únicos para os Efetores Dinâmicos
+dragLog = hubDrag.logger(["forceExternal_B", "torqueExternalPntB_B"], samplingTime)
+srpLog = SRPEffector.logger(["forceExternal_B", "torqueExternalPntB_B"], samplingTime)
+ggLog = ggEff.logger(["torqueExternalPntB_B"], samplingTime)
+
+scSim.AddModelToTask(simTaskName, dragLog)
+scSim.AddModelToTask(simTaskName, srpLog)
+scSim.AddModelToTask(simTaskName, ggLog)
+
+# Registradores das RW
+rwSpeedLog = rwStateEffector.rwSpeedOutMsg.recorder(samplingTime)
+scSim.AddModelToTask(simTaskName, rwSpeedLog)
+
+rwCmdTorqueLog = rwMotorTorqueObj.rwMotorTorqueOutMsg.recorder(samplingTime)
+scSim.AddModelToTask(fswTaskName, rwCmdTorqueLog)
+
+rwVoltLog = fswRWVoltage.voltageOutMsg.recorder(samplingTime)
+scSim.AddModelToTask(fswTaskName, rwVoltLog)
+
+# 2. DEFINIÇÃO DO ARQUICO DE VISUALIZAÇÃO
+viz = vizSupport.enableUnityVisualization(
+    scSim, 
+    simTaskName, 
+    scObject,
+    saveFile="sim3U_CubeSat.bin",
+    rwEffectorList=rwStateEffector)
+
+viz.epochInMsg.subscribeTo(gravFactory.epochMsg)
+viz.settings.ambient = 0.8
+
+viz.settings.showForceVectors = 1    
+viz.settings.showTorqueVectors = 1    
+
+# 3. EXECUÇÃO DA SIMULAÇÃO
+scSim.InitializeSimulation()
+scSim.ConfigureStopTime(simulationTime)
+scSim.ExecuteSimulation()
+
+# 4. EXTRAÇÃO E PROCESSAMENTO DOS DADOS
+
+# Tempo em órbitas
+timeOrbits = (snLog.times() * macros.NANO2SEC) / P
+timeOrbits_tam = (tamLog.times() * macros.NANO2SEC) / P
+
+# Posição, altitude e variáveis de atitude
+posData_global = snLog.r_BN_N
+attErrSigma_global = attErrorLog.sigma_BR
+attErrOmega_global = attErrorLog.omega_BR_B
+quatErr_global = np.array([rbk.MRP2EP(s) for s in attErrSigma_global])
+
+pos_matrix = np.array(posData_global).reshape(-1, 3)
+r_mag = np.linalg.norm(pos_matrix, axis=1)
+altitude_km = (r_mag - planet.radEquator) / 1000.0
+
+# Variáveis estocásticas
+rho_deterministic = np.array(deterministicAtmoLog.neutralDensity)
+rho_stochastic = np.array(stochasticAtmoLog.neutralDensity)
+solar_flux_data = np.array(solarLog.flux)
+magData = magLog.magField_N
+tamData = tamLog.tam_S
+
+# Magnitudes de Força [N] e Torque [N*m]
+magForceDrag = np.linalg.norm(dragLog.forceExternal_B, axis=1)
+magForceSRP  = np.linalg.norm(srpLog.forceExternal_B, axis=1)
+
+magTorqueDrag = np.linalg.norm(dragLog.torqueExternalPntB_B, axis=1)
+magTorqueSRP  = np.linalg.norm(srpLog.torqueExternalPntB_B, axis=1)
+magTorqueGG   = np.linalg.norm(ggLog.torqueExternalPntB_B, axis=1)
+dataCmdTorqueRW = rwCmdTorqueLog.motorTorque
+dataTorqueMTB = mtbLog.torqueExternalPntB_B
+
+# Dados das RW
+dataOmegaRW = rwSpeedLog.wheelSpeeds / macros.RPM  # Converte rad/s para RPM
+dataVoltRW = rwVoltLog.voltage
+
+# 5. PLOTAGEM ESTRUTURADA E ORGANIZADA
+plt.close("all")
+
+# ------------------------------------------------------------------------------
+# FIGURA 1: Erro de Atitude (Quatérnio de Erro em Relação ao Nadir)
+# ------------------------------------------------------------------------------
+fig1, ax1 = plt.subplots(figsize=(9, 4))
+ax1.plot(timeOrbits, quatErr_global[:, 0], label=r'$q_0$ (Escalar)', color='black', linewidth=1.2)
+ax1.plot(timeOrbits, quatErr_global[:, 1], label=r'$q_1$ (Eixo $x$)', color='tab:red')
+ax1.plot(timeOrbits, quatErr_global[:, 2], label=r'$q_2$ (Eixo $y$)', color='tab:green')
+ax1.plot(timeOrbits, quatErr_global[:, 3], label=r'$q_3$ (Eixo $z$)', color='tab:blue')
+ax1.set_title(r"Evolução do Quatérnio de Erro em Relação ao Nadir ($q_{B/R}$)")
+ax1.set_xlabel("Tempo [Órbitas]")
+ax1.set_ylabel("Componentes $q$")
+ax1.legend(loc="upper right")
+ax1.grid(True, linestyle="--", alpha=0.6)
+plt.tight_layout()
+
+# ------------------------------------------------------------------------------
+# FIGURA 2: Erro de Velocidade Angular
+# ------------------------------------------------------------------------------
+fig2, ax2 = plt.subplots(figsize=(9, 4))
+omega_deg = attErrOmega_global * macros.R2D
+ax2.plot(timeOrbits, omega_deg[:, 0], label=r'$\omega_{x}$', color='tab:red')
+ax2.plot(timeOrbits, omega_deg[:, 1], label=r'$\omega_{y}$', color='tab:green')
+ax2.plot(timeOrbits, omega_deg[:, 2], label=r'$\omega_{z}$', color='tab:blue')
+ax2.set_title(r"Erro de Velocidade Angular ($\omega_{B/R}$)")
+ax2.set_xlabel("Tempo [Órbitas]")
+ax2.set_ylabel("Velocidade Angular [deg/s]")
+ax2.legend(loc="upper right")
+ax2.grid(True, linestyle="--", alpha=0.6)
+plt.tight_layout()
+
+# ------------------------------------------------------------------------------
+# FIGURA 3: Torque de Gradiente de Gravidade
+# ------------------------------------------------------------------------------
+fig3, ax3 = plt.subplots(figsize=(9, 4))
+ax3.semilogy(timeOrbits[1:], magTorqueGG[1:], color='tab:blue', linewidth=1.2)
+ax3.set_title(r"Magnitude do Torque de Gradiente de Gravidade ($|L_{GG}|$)")
+ax3.set_xlabel("Tempo [Órbitas]")
+ax3.set_ylabel("Torque [N·m]")
+ax3.grid(True, which="both", linestyle="--", alpha=0.6)
+plt.tight_layout()
+
+# ------------------------------------------------------------------------------
+# FIGURA 4: Força Aerodinâmica (Arrasto)
+# ------------------------------------------------------------------------------
+fig4, ax4 = plt.subplots(figsize=(9, 4))
+ax4.semilogy(timeOrbits[1:], magForceDrag[1:], color='tab:blue', linewidth=1.2)
+ax4.set_title(r"Magnitude da Força de Arrasto Aerodinâmico ($|F_{drag}|$)")
+ax4.set_xlabel("Tempo [Órbitas]")
+ax4.set_ylabel("Força [N]")
+ax4.grid(True, which="both", linestyle="--", alpha=0.6)
+plt.tight_layout()
+
+# ------------------------------------------------------------------------------
+# FIGURA 5: Torque Aerodinâmico (Arrasto)
+# ------------------------------------------------------------------------------
+fig5, ax5 = plt.subplots(figsize=(9, 4))
+ax5.semilogy(timeOrbits[1:], magTorqueDrag[1:], color='tab:red', linewidth=1.2)
+ax5.set_title(r"Magnitude do Torque de Arrasto Aerodinâmico ($|L_{drag}|$)")
+ax5.set_xlabel("Tempo [Órbitas]")
+ax5.set_ylabel("Torque [N·m]")
+ax5.grid(True, which="both", linestyle="--", alpha=0.6)
+plt.tight_layout()
+
+# ------------------------------------------------------------------------------
+# FIGURA 6: Força SRP (Pressão de Radiação Solar)
+# ------------------------------------------------------------------------------
+fig6, ax6 = plt.subplots(figsize=(9, 4))
+ax6.semilogy(timeOrbits[1:], magForceSRP[1:], color='tab:orange', linewidth=1.2)
+ax6.set_title(r"Magnitude da Força de Pressão de Radiação Solar ($|F_{SRP}|$)")
+ax6.set_xlabel("Tempo [Órbitas]")
+ax6.set_ylabel("Força [N]")
+ax6.grid(True, which="both", linestyle="--", alpha=0.6)
+plt.tight_layout()
+
+# ------------------------------------------------------------------------------
+# FIGURA 7: Torque SRP (Pressão de Radiação Solar)
+# ------------------------------------------------------------------------------
+fig7, ax7 = plt.subplots(figsize=(9, 4))
+ax7.semilogy(timeOrbits[1:], magTorqueSRP[1:], color='tab:orange', linewidth=1.2)
+ax7.set_title(r"Magnitude do Torque de Pressão de Radiação Solar ($|L_{SRP}|$)")
+ax7.set_xlabel("Tempo [Órbitas]")
+ax7.set_ylabel("Torque [N·m]")
+ax7.grid(True, which="both", linestyle="--", alpha=0.6)
+plt.tight_layout()
+
+# ------------------------------------------------------------------------------
+# FIGURA 8: Campo Magnético Medido (TAM MPU9250)
+# ------------------------------------------------------------------------------
+fig8, ax8 = plt.subplots(figsize=(9, 4))
+ax8.plot(timeOrbits_tam, tamData[:, 0] * 1e9, label=r'$B_{B,x}$', color='tab:red')
+ax8.plot(timeOrbits_tam, tamData[:, 1] * 1e9, label=r'$B_{B,y}$', color='tab:green')
+ax8.plot(timeOrbits_tam, tamData[:, 2] * 1e9, label=r'$B_{B,z}$', color='tab:blue')
+ax8.set_title("Vetor de Campo Magnético Medido no Referencial do Satélite (TAM)")
+ax8.set_xlabel("Tempo [Órbitas]")
+ax8.set_ylabel("Campo Magnético [nT]")
+ax8.legend(loc="upper right")
+ax8.grid(True, linestyle="--", alpha=0.6)
+plt.tight_layout()
+
+# ------------------------------------------------------------------------------
+# FIGURA 9: Velocidade Angular das Rodas de Reação (RPM)
+# ------------------------------------------------------------------------------
+fig9, ax9 = plt.subplots(figsize=(9, 4.5))
+ax9.plot(timeOrbits, dataOmegaRW[:, 0], label=r'$\Omega_1$ (Eixo $x$)', color='tab:red', linewidth=1.2)
+ax9.plot(timeOrbits, dataOmegaRW[:, 1], label=r'$\Omega_2$ (Eixo $y$)', color='tab:green', linewidth=1.2)
+ax9.plot(timeOrbits, dataOmegaRW[:, 2], label=r'$\Omega_3$ (Eixo $z$)', color='tab:blue', linewidth=1.2)
+ax9.axhline(15000.0, color='black', linestyle='--', alpha=0.7, label=r'Saturação ($\pm 15.000$ RPM)')
+ax9.axhline(-15000.0, color='black', linestyle='--', alpha=0.7)
+ax9.set_title("Velocidade Angular das Rodas de Reação Hyperion RW210")
+ax9.set_xlabel("Tempo [Órbitas]")
+ax9.set_ylabel("Velocidade [RPM]")
+ax9.legend(loc="upper right")
+ax9.grid(True, linestyle="--", alpha=0.6)
+plt.tight_layout()
+
+# ------------------------------------------------------------------------------
+# FIGURA 10: Sinal de Tensão Comandado às RWs
+# ------------------------------------------------------------------------------
+fig10, ax10 = plt.subplots(figsize=(9, 4.5))
+ax10.plot(timeOrbits, dataVoltRW[:, 0], label=r'$V_1$', color='tab:red', linewidth=1.2)
+ax10.plot(timeOrbits, dataVoltRW[:, 1], label=r'$V_2$', color='tab:green', linewidth=1.2)
+ax10.plot(timeOrbits, dataVoltRW[:, 2], label=r'$V_3$', color='tab:blue', linewidth=1.2)
+ax10.axhline(3.5, color='black', linestyle='--', alpha=0.7, label=r'Limite de Tensão ($\pm 3.5$ V)')
+ax10.axhline(-3.5, color='black', linestyle='--', alpha=0.7)
+ax10.set_title("Sinal de Tensão Aplicado aos Motores (FSW -> Hardware)")
+ax10.set_xlabel("Tempo [Órbitas]")
+ax10.set_ylabel("Tensão [V]")
+ax10.legend(loc="upper right")
+ax10.grid(True, linestyle="--", alpha=0.6)
+plt.tight_layout()
+
+# ------------------------------------------------------------------------------
+# FIGURA 11: Torque Magnético Gerado pelo MTB (Hyperion HT-MTQ200)
+# ------------------------------------------------------------------------------
+fig11, ax11 = plt.subplots(figsize=(9, 4.5))
+ax11.plot(timeOrbits, dataTorqueMTB[:, 0] * 1e6, label=r'$\tau_{MTB,x}$', color='tab:red', linewidth=1.2)
+ax11.plot(timeOrbits, dataTorqueMTB[:, 1] * 1e6, label=r'$\tau_{MTB,y}$', color='tab:green', linewidth=1.2)
+ax11.plot(timeOrbits, dataTorqueMTB[:, 2] * 1e6, label=r'$\tau_{MTB,z}$', color='tab:blue', linewidth=1.2)
+ax11.set_title("Torque Magnético Gerado pelo MTB Hyperion HT-MTQ200")
+ax11.set_xlabel("Tempo [Órbitas]")
+ax11.set_ylabel(r"Torque [$\mu\text{N}\cdot\text{m}$]")
+ax11.legend(loc="upper right")
+ax11.grid(True, linestyle="--", alpha=0.6)
+plt.tight_layout()
+
+plt.show()
