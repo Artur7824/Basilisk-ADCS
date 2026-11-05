@@ -16,5 +16,3 @@ Basilisk - ADCS/
 ├── references/              # Documentação técnica e artigos  
 ├── examples/                # Scripts e cenários de referência do próprio Basilisk
 ├── testes/                  # Etapas graduais, simulações intermediárias e testes do Colab
-├── README.md                # Documentação principal do projeto
-└── requirements.txt         # Dependências das bibliotecas Python
