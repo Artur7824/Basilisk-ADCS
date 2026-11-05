@@ -12,10 +12,9 @@ O projeto final simula a transição operacional da espaçonave em dois estágio
 
 ```text
 Basilisk - ADCS/
-├── vizard/                       # Modelo .glb para visualização 3D no Vizard
-├── references/                # Documentação técnica e artigos  
-├── examples/                  # Scripts e cenários de referência do próprio Basilisk
-├── testes/                        # Etapas graduais, simulações intermediárias e testes do Colab
-├── .gitignore                   # Arquivos ignorados pelo Git
-├── README.md               # Documentação principal do projeto
+├── vizard/                  # Modelo .glb para visualização 3D no Vizard
+├── references/              # Documentação técnica e artigos  
+├── examples/                # Scripts e cenários de referência do próprio Basilisk
+├── testes/                  # Etapas graduais, simulações intermediárias e testes do Colab
+├── README.md                # Documentação principal do projeto
 └── requirements.txt         # Dependências das bibliotecas Python
