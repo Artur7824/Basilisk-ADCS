@@ -14,5 +14,5 @@ O projeto final simula a transição operacional da espaçonave em dois estágio
 Basilisk - ADCS/
 ├── vizard/                  # Modelo .glb para visualização 3D no Vizard
 ├── references/              # Documentação técnica e artigos  
-├── examples/                # Scripts e cenários de referência do próprio Basilisk
-├── testes/                  # Etapas graduais, simulações intermediárias e testes do Colab
+├── examples/                # Scripts de referência do próprio Basilisk
+├── testes/                  # Testes graduais implementados no Colab
