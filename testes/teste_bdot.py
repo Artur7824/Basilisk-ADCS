@@ -573,11 +573,20 @@ viz = vizSupport.enableUnityVisualization(
 viz.epochInMsg.subscribeTo(gravFactory.epochMsg)
 viz.settings.ambient = 0.8
 
+import os
+
+diretorio_atual = os.path.dirname(os.path.abspath(__file__))
+
+# Certifique-se de mover a pasta 'vizard' para junto do seu script .py
+model_path = os.path.join(diretorio_atual, "vizard", "cimatelite.glb")
+
+# Executa a função com o caminho universal
 vizSupport.createCustomModel(
-    viz,
-    modelPath=r"C:\Users\azeve\Downloads\basilisk\cubesat3u_model\cimatelite.glb",   
-    simBodiesToModify=["cimatelite"],
-    scale=[7.0, 7.0, 7.0])  
+    viz, 
+    modelPath=model_path, 
+    simBodiesToModify=["cimatelite"], 
+    scale=[7.0, 7.0, 7.0]
+)  
 
 # EXECUÇÃO
 print(f"Período orbital P = {P:.1f} s | Ganho B-dot = {kGain:.3e} A*m^2/(T/s) | "
