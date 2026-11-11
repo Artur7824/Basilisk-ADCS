@@ -608,10 +608,7 @@ viz = vizSupport.enableUnityVisualization(
     rwEffectorList=rwStateEffector)
 
 viz.epochInMsg.subscribeTo(gravFactory.epochMsg)
-viz.settings.ambient = 0.8
-
-viz.settings.showForceVectors = 1    
-viz.settings.showTorqueVectors = 1    
+viz.settings.ambient = 0.8  
 
 # 3. EXECUÇÃO DA SIMULAÇÃO
 scSim.InitializeSimulation()
